@@ -1,0 +1,10 @@
+# Editor / tooling workspaces
+.theia/
+.claude/
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.log
