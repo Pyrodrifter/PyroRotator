@@ -1,0 +1,13 @@
+# Keep source text LF-normalized…
+* text=auto eol=lf
+
+# …but never EOL-convert binaries (a small PDF can be mis-detected as text and
+# get CRLF-mangled, which corrupts it).
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.bin binary
+*.hex binary
+*.elf binary
