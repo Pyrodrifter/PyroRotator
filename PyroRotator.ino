@@ -50,7 +50,7 @@ const float SPD_AZ = (MOTOR_STEPS * MICROSTEP * GEAR_AZ) / 360.0;
 const float SPD_EL = (MOTOR_STEPS * MICROSTEP * GEAR_EL) / 360.0;
 
 // --- Travel / soft limits (degrees) ---
-const float AZ_MIN = 0.0,   AZ_MAX = 450.0;   // 90° overlap past full rotation; unwind manually
+const float AZ_MIN = -3600.0, AZ_MAX = 3600.0; // az is free (shortest-path); wide bound for velocity-jog only
 const float EL_MIN = 0.0;
 // EL_MAX is runtime-togglable via /api/elmode (90 = normal, 180 = flip-over passes)
 float g_elMax = 90.0;
@@ -131,8 +131,21 @@ String controlStr() {
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// Nearest equivalent of a target heading to the current azimuth — the shortest-path
+// move (never more than 180°). Used by one-shot gotos (web/rotctld/park/jog) so e.g.
+// 0°→330° goes −30°, not +330°. (Streamed SuperRot 'A' setpoints stay absolute; the
+// host already resolves their continuity.)
+float shortestAz(float target, float cur) {
+  float d = target - cur;
+  d -= 360.0f * roundf(d / 360.0f);
+  return cur + d;
+}
+
 void gotoAzEl(float a, float e) {
-  a = clampf(a, AZ_MIN, AZ_MAX);
+  // Azimuth is FREE (no clamp) and takes the SHORTEST PATH from where it is — so a
+  // one-shot goto to any heading turns the short way (may go negative). Only elevation
+  // is bounded (0..elMax, elMax up to 180 for flip).
+  a = shortestAz(a, currentAz());
   e = clampf(e, EL_MIN, g_elMax);
   g_targetAz = a; g_targetEl = e;
   motorsEnable();
@@ -166,8 +179,7 @@ void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi) {
 }
 
 void srTrack(float a, float e, float aRate, float eRate) {
-  a = clampf(a, AZ_MIN, AZ_MAX);
-  e = clampf(e, EL_MIN, g_elMax);
+  e = clampf(e, EL_MIN, g_elMax);  // az free (shortest-path); el bounded
   g_targetAz = a; g_targetEl = e;
   motorsEnable();
   srAxisTrack(az, a, aRate, SPD_AZ);
