@@ -25,7 +25,7 @@ jobs:
     env:
       FQBN: esp32:esp32:esp32
       ESP32_CORE_VERSION: 3.3.0
-      ACCELSTEPPER_VERSION: 1.65
+      ACCELSTEPPER_VERSION: 1.64.0
     steps:
       - uses: actions/checkout@v4
 
