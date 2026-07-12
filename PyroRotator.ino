@@ -90,6 +90,8 @@ uint8_t g_settleAz = 0, g_settleEl = 0;
 uint32_t g_lastTrackMs = 0;
 uint32_t g_lastTrackSeq = 0;
 bool g_trackStreamActive = false;
+float g_trackCapAz = MAX_SPEED, g_trackCapEl = MAX_SPEED;
+uint32_t g_trackCapMsAz = 0, g_trackCapMsEl = 0;
 
 enum MotionMode : uint8_t { MM_IDLE, MM_GOTO, MM_SLEW, MM_CAPTURE, MM_TRACK, MM_HOMING, MM_PARK, MM_FAULT };
 enum FaultCode : uint8_t { FAULT_NONE, FAULT_COMMAND_TIMEOUT, FAULT_HOME };
@@ -229,8 +231,25 @@ void gotoAzEl(float a, float e) {
 // Track: drive toward a position at a velocity-derived speed cap. Because the
 // host streams setpoints continuously, the axis keeps moving instead of
 // decelerating to a halt on each command -> smooth tracking.
+// AccelStepper acceleration-limits the generated step rate, but lowering maxSpeed
+// abruptly can still clip that rate between streamed commands. Ramp reductions so
+// capture/track transitions cannot create a mechanical jerk. During acquisition we
+// leave the cap at the configured maximum and let AccelStepper's acceleration profile
+// do the slewing; Kp is only used to choose the gentler capture/tracking cap.
+float smoothTrackCap(float requested, float maxHz, float &applied, uint32_t &lastMs) {
+  uint32_t now = millis();
+  float dt = lastMs ? fminf((now - lastMs) * 0.001f, 0.25f) : 0.0f;
+  lastMs = now;
+  requested = clampf(requested, 1.0f, maxHz);
+  if (applied <= 0 || applied > maxHz) applied = maxHz;
+  if (requested >= applied || dt <= 0) applied = requested;
+  else applied = fmaxf(requested, applied - ACCEL * dt);
+  return applied;
+}
+
 void srAxisTrack(AccelStepper &s, float deg, float rate, float spd, float maxHz,
-                 TrackState &state, uint8_t &settle, int &lastDir, float backlashDeg) {
+                 TrackState &state, uint8_t &settle, int &lastDir, float backlashDeg,
+                 float &appliedCap, uint32_t &capMs) {
   float err = deg - s.currentPosition() / spd;
   float ae = fabs(err);
   if (state == TS_SLEW) {
@@ -252,11 +271,11 @@ void srAxisTrack(AccelStepper &s, float deg, float rate, float spd, float maxHz,
   }
   if (dir && fabs(commandedRate) > 0.01f) lastDir = dir;
 
-  float hz = fabs(commandedRate) * spd;
+  float hz = state == TS_SLEW ? maxHz : fabs(commandedRate) * spd;
   float floorHz = 0.5f * spd / 60.0f;          // tiny floor so position still trims
   if (hz < floorHz) hz = floorHz;
   if (hz > maxHz) hz = maxHz;
-  s.setMaxSpeed(hz);
+  s.setMaxSpeed(smoothTrackCap(hz, maxHz, appliedCap, capMs));
   s.moveTo(lround(deg * spd));
 }
 
@@ -272,12 +291,24 @@ void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi, float
 void srTrack(float a, float e, float aRate, float eRate) {
   e = clampf(e, EL_MIN, g_elMax);  // az free (shortest-path); el bounded
   g_targetAz = a; g_targetEl = e;
+  bool startingStream = !g_trackStreamActive;
   g_lastTrackMs = millis();
   g_trackStreamActive = true;
+  if (startingStream) {
+    // A previous pass may have ended in TRACK with a very low speed cap. Always
+    // reacquire a new stream from SLEW and restore the full caps; acceleration is
+    // still enforced by AccelStepper, so this does not command an instantaneous jump.
+    g_trackAz = g_trackEl = TS_SLEW;
+    g_settleAz = g_settleEl = 0;
+    g_trackCapAz = g_maxSpeedAz; g_trackCapEl = g_maxSpeedEl;
+    g_trackCapMsAz = g_trackCapMsEl = g_lastTrackMs;
+  }
   clearFault();
   motorsEnable();
-  srAxisTrack(az, a, aRate, SPD_AZ, g_maxSpeedAz, g_trackAz, g_settleAz, g_lastDirAz, g_backlashAz);
-  srAxisTrack(el, e, eRate, SPD_EL, g_maxSpeedEl, g_trackEl, g_settleEl, g_lastDirEl, g_backlashEl);
+  srAxisTrack(az, a, aRate, SPD_AZ, g_maxSpeedAz, g_trackAz, g_settleAz, g_lastDirAz, g_backlashAz,
+              g_trackCapAz, g_trackCapMsAz);
+  srAxisTrack(el, e, eRate, SPD_EL, g_maxSpeedEl, g_trackEl, g_settleEl, g_lastDirEl, g_backlashEl,
+              g_trackCapEl, g_trackCapMsEl);
   g_motionMode = (g_trackAz == TS_SLEW || g_trackEl == TS_SLEW) ? MM_SLEW
     : (g_trackAz == TS_CAPTURE || g_trackEl == TS_CAPTURE) ? MM_CAPTURE : MM_TRACK;
 }
@@ -591,10 +622,11 @@ void handleTcp() {
     static uint32_t lastT = 0;
     if (millis() - lastT >= 100) {
       lastT = millis();
-      rotClient.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+      rotClient.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
         currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
         az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
         g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
+        g_trackCapAz, g_trackCapEl,
         (unsigned long)(g_lastTrackMs ? millis() - g_lastTrackMs : 0),
         digitalRead(AZ_LIM) == LOW ? 1 : 0, digitalRead(EL_LIM) == LOW ? 1 : 0,
         g_homed ? 1 : 0, temperatureRead());
@@ -646,10 +678,11 @@ void handleSerial() {
   }
   if (superrotSession && millis() - lastT >= 100) {
     lastT = millis();
-    Serial.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+    Serial.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
       currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
       az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
       g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
+      g_trackCapAz, g_trackCapEl,
       (unsigned long)(g_lastTrackMs ? millis() - g_lastTrackMs : 0),
       digitalRead(AZ_LIM) == LOW ? 1 : 0, digitalRead(EL_LIM) == LOW ? 1 : 0,
       g_homed ? 1 : 0, temperatureRead());
