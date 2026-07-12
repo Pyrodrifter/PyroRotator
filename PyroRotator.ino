@@ -83,6 +83,7 @@ float g_azOffset = 0, g_elOffset = 0;      // mount-alignment offset (deg) — s
                                            // standalone use; host applies its own offset,
                                            // so SuperRot 'A' tracking does NOT re-apply it
 float g_backlashAz = 0, g_backlashEl = 0;  // gear backlash (deg) — taken up on gotos
+float g_trimAz = 0, g_trimEl = 0;          // physical alignment trim, degrees
 int   g_lastDirAz = 0, g_lastDirEl = 0;    // last commanded travel direction per axis
 enum TrackState : uint8_t { TS_SLEW, TS_CAPTURE, TS_TRACK };
 TrackState g_trackAz = TS_SLEW, g_trackEl = TS_SLEW;
@@ -135,6 +136,8 @@ WiFiClient rotClient;
 bool  g_homed = false;
 bool  g_homeErr = false;   // true if the last homing run never found the EL limit switch
 float g_targetAz = 0, g_targetEl = 0;
+char g_missionTarget[32] = "";
+char g_missionState[16] = "idle";
 
 // TCP 4533 protocol mode, toggled from the web app via /api/proto.
 //   ROTCTLD  = Hamlib net-rotctl (P/p/S) — go-to-and-stop, lurches on each update
@@ -147,8 +150,10 @@ Proto g_proto = PROTO_ROTCTLD;
 inline void motorsEnable()  { digitalWrite(EN_PIN, LOW);  }
 inline void motorsDisable() { digitalWrite(EN_PIN, HIGH); }
 
-float currentAz() { return az.currentPosition() / SPD_AZ; }
-float currentEl() { return el.currentPosition() / SPD_EL; }
+float rawAz() { return az.currentPosition() / SPD_AZ; }
+float rawEl() { return el.currentPosition() / SPD_EL; }
+float currentAz() { return rawAz() - g_trimAz; }
+float currentEl() { return rawEl() - g_trimEl; }
 bool  isMoving()  { return az.distanceToGo() != 0 || el.distanceToGo() != 0; }
 
 // HH:MM:SS since boot (wraps after ~49 days, fine for a status readout)
@@ -223,8 +228,8 @@ void gotoAzEl(float a, float e) {
   // restore full (configured) speed in case SuperRot velocity-capped it on a previous move
   az.setMaxSpeed(g_maxSpeedAz);
   el.setMaxSpeed(g_maxSpeedEl);
-  az.moveTo(backlashBias(az, lround(a * SPD_AZ), g_backlashAz * SPD_AZ, g_lastDirAz));
-  el.moveTo(backlashBias(el, lround(e * SPD_EL), g_backlashEl * SPD_EL, g_lastDirEl));
+  az.moveTo(backlashBias(az, lround((a + g_trimAz) * SPD_AZ), g_backlashAz * SPD_AZ, g_lastDirAz));
+  el.moveTo(backlashBias(el, lround((e + g_trimEl) * SPD_EL), g_backlashEl * SPD_EL, g_lastDirEl));
 }
 
 // --- SuperRot continuous motion (AccelStepper adaptation) ------------------
@@ -249,8 +254,8 @@ float smoothTrackCap(float requested, float maxHz, float &applied, uint32_t &las
 
 void srAxisTrack(AccelStepper &s, float deg, float rate, float spd, float maxHz,
                  TrackState &state, uint8_t &settle, int &lastDir, float backlashDeg,
-                 float &appliedCap, uint32_t &capMs) {
-  float err = deg - s.currentPosition() / spd;
+                 float &appliedCap, uint32_t &capMs, float trim) {
+  float err = deg - (s.currentPosition() / spd - trim);
   float ae = fabs(err);
   if (state == TS_SLEW) {
     if (ae < g_captureErr) state = TS_CAPTURE;
@@ -276,7 +281,7 @@ void srAxisTrack(AccelStepper &s, float deg, float rate, float spd, float maxHz,
   if (hz < floorHz) hz = floorHz;
   if (hz > maxHz) hz = maxHz;
   s.setMaxSpeed(smoothTrackCap(hz, maxHz, appliedCap, capMs));
-  s.moveTo(lround(deg * spd));
+  s.moveTo(lround((deg + trim) * spd));
 }
 
 // Pure velocity: drive toward the soft limit in the rate's direction at |rate|.
@@ -285,7 +290,8 @@ void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi, float
   rate = clampf(rate, -maxd, maxd);
   if (fabs(rate) < 1e-4) { s.moveTo(s.currentPosition()); return; }
   s.setMaxSpeed(fabs(rate) * spd);
-  s.moveTo(lround((rate > 0 ? hi : lo) * spd));
+  float trim = (&s == &az) ? g_trimAz : g_trimEl;
+  s.moveTo(lround(((rate > 0 ? hi : lo) + trim) * spd));
 }
 
 void srTrack(float a, float e, float aRate, float eRate) {
@@ -306,9 +312,9 @@ void srTrack(float a, float e, float aRate, float eRate) {
   clearFault();
   motorsEnable();
   srAxisTrack(az, a, aRate, SPD_AZ, g_maxSpeedAz, g_trackAz, g_settleAz, g_lastDirAz, g_backlashAz,
-              g_trackCapAz, g_trackCapMsAz);
+              g_trackCapAz, g_trackCapMsAz, g_trimAz);
   srAxisTrack(el, e, eRate, SPD_EL, g_maxSpeedEl, g_trackEl, g_settleEl, g_lastDirEl, g_backlashEl,
-              g_trackCapEl, g_trackCapMsEl);
+              g_trackCapEl, g_trackCapMsEl, g_trimEl);
   g_motionMode = (g_trackAz == TS_SLEW || g_trackEl == TS_SLEW) ? MM_SLEW
     : (g_trackAz == TS_CAPTURE || g_trackEl == TS_CAPTURE) ? MM_CAPTURE : MM_TRACK;
 }
@@ -352,7 +358,7 @@ void unwindAz() {
   g_targetAz = u;
   motorsEnable();
   az.setMaxSpeed(g_maxSpeedAz);
-  az.moveTo(lround(u * SPD_AZ));
+  az.moveTo(lround((u + g_trimAz) * SPD_AZ));
 }
 
 // Drive one axis until its limit switch (active LOW) reads LOW; stop on first
@@ -420,10 +426,11 @@ void homeAll() {
   g_motionMode = MM_HOMING;
   motorsEnable();
   // Az: no limit switch — physical 0° set by compass before power-up.
-  az.setCurrentPosition(0);
+  az.setCurrentPosition(lround(g_trimAz * SPD_AZ));
 
   // El: drive to lower end stop, back off, zero. Flag if the switch was never seen.
   g_homeErr = !homeAxis(el, EL_LIM, HOME_DIR_EL, SPD_EL);
+  if (!g_homeErr) el.setCurrentPosition(lround(g_trimEl * SPD_EL));
   g_homed   = !g_homeErr;
   g_fault = g_homeErr ? FAULT_HOME : FAULT_NONE;
   g_motionMode = g_homeErr ? MM_FAULT : MM_IDLE;
@@ -440,18 +447,22 @@ void homeAll() {
 void handleRoot()   { http.send_P(200, "text/html", INDEX_HTML); }
 
 void handleStatus() {
-  char b[440];
+  char b[700];
   snprintf(b, sizeof(b),
     "{\"az\":%.2f,\"el\":%.2f,\"taz\":%.2f,\"tel\":%.2f,"
     "\"moving\":%s,\"homed\":%s,\"homeerr\":%s,\"ellim\":%s,\"azlim\":%s,\"ip\":\"%s\","
-    "\"rssi\":%d,\"uptime\":\"%s\",\"control\":\"%s\",\"elMax\":%.0f,\"proto\":\"%s\"}",
+    "\"rssi\":%d,\"uptime\":\"%s\",\"control\":\"%s\",\"elMax\":%.0f,\"proto\":\"%s\","
+    "\"motion\":\"%s\",\"trackState\":\"%s\",\"fault\":\"%s\",\"trimAz\":%.3f,\"trimEl\":%.3f,"
+    "\"missionTarget\":\"%s\",\"missionState\":\"%s\"}",
     currentAz(), currentEl(), g_targetAz, g_targetEl,
     isMoving() ? "true" : "false", g_homed ? "true" : "false", g_homeErr ? "true" : "false",
     digitalRead(EL_LIM) == LOW ? "true" : "false",   // true = EL switch pressed (pulled low)
     digitalRead(AZ_LIM) == LOW ? "true" : "false",
     WiFi.localIP().toString().c_str(),
     (int)WiFi.RSSI(), uptimeStr().c_str(), controlStr().c_str(), g_elMax,
-    g_proto == PROTO_SUPERROT ? "superrot" : "rotctld");
+    g_proto == PROTO_SUPERROT ? "superrot" : "rotctld",
+    motionModeName(), trackStateName(), faultName(), g_trimAz, g_trimEl,
+    g_missionTarget, g_missionState);
   http.send(200, "application/json", b);
 }
 
@@ -467,6 +478,15 @@ void handleJog() {
   if (ax == "az") gotoAzEl(g_targetAz + d, g_targetEl);
   else            gotoAzEl(g_targetAz, g_targetEl + d);
   http.send(200, "text/plain", "OK");
+}
+
+void handleTrim() {
+  if (http.hasArg("az")) g_trimAz = clampf(http.arg("az").toFloat(), -10.0f, 10.0f);
+  if (http.hasArg("el")) g_trimEl = clampf(http.arg("el").toFloat(), -10.0f, 10.0f);
+  prefs.putFloat("trimAz", g_trimAz); prefs.putFloat("trimEl", g_trimEl);
+  if (!g_trackStreamActive) gotoAzEl(g_targetAz, g_targetEl);
+  char b[80]; snprintf(b, sizeof(b), "{\"trimAz\":%.3f,\"trimEl\":%.3f}", g_trimAz, g_trimEl);
+  http.send(200, "application/json", b);
 }
 
 void handleStop()   { stopAll();              http.send(200, "text/plain", "OK"); }
@@ -536,6 +556,7 @@ void saveRuntimeConfig() {
   prefs.putFloat("maxAzHz", g_maxSpeedAz); prefs.putFloat("maxElHz", g_maxSpeedEl);
   prefs.putFloat("elMax", g_elMax); prefs.putFloat("azOff", g_azOffset); prefs.putFloat("elOff", g_elOffset);
   prefs.putFloat("backAz", g_backlashAz); prefs.putFloat("backEl", g_backlashEl);
+  prefs.putFloat("trimAz", g_trimAz); prefs.putFloat("trimEl", g_trimEl);
   prefs.putFloat("trkKp", g_trackKp); prefs.putFloat("capErr", g_captureErr); prefs.putFloat("trkErr", g_trackErr);
   prefs.putFloat("stHyst", g_stateHyst); prefs.putFloat("revHyst", g_reverseHyst);
   prefs.putUChar("settle", g_settleSamples); prefs.putUInt("timeout", g_commandTimeoutMs);
@@ -545,6 +566,7 @@ void loadRuntimeConfig() {
   g_maxSpeedAz = prefs.getFloat("maxAzHz", MAX_SPEED); g_maxSpeedEl = prefs.getFloat("maxElHz", MAX_SPEED);
   g_elMax = prefs.getFloat("elMax", 90); g_azOffset = prefs.getFloat("azOff", 0); g_elOffset = prefs.getFloat("elOff", 0);
   g_backlashAz = prefs.getFloat("backAz", 0); g_backlashEl = prefs.getFloat("backEl", 0);
+  g_trimAz = prefs.getFloat("trimAz", 0); g_trimEl = prefs.getFloat("trimEl", 0);
   g_trackKp = prefs.getFloat("trkKp", 1.6); g_captureErr = prefs.getFloat("capErr", .5);
   g_trackErr = prefs.getFloat("trkErr", .08); g_stateHyst = prefs.getFloat("stHyst", .04);
   g_reverseHyst = prefs.getFloat("revHyst", .06); g_settleSamples = prefs.getUChar("settle", 5);
@@ -564,10 +586,39 @@ void parseConfig(String &line) {
   saveRuntimeConfig();
 }
 
+int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+String decodeMissionToken(const char* token) {
+  String out;
+  for (size_t i = 0; token[i] && out.length() < 31; ++i) {
+    if (token[i] == '%' && token[i + 1] && token[i + 2]) {
+      int hi = hexNibble(token[i + 1]), lo = hexNibble(token[i + 2]);
+      if (hi >= 0 && lo >= 0) { out += char((hi << 4) | lo); i += 2; continue; }
+    }
+    out += token[i] == '+' ? ' ' : token[i];
+  }
+  out.replace("\"", ""); out.replace("\\", "");
+  return out;
+}
+
+void parseMission(String &line) {
+  char target[64] = {0}, state[32] = {0};
+  if (sscanf(line.c_str() + 1, "%63s %31s", target, state) < 1) return;
+  String t = decodeMissionToken(target), s = decodeMissionToken(state);
+  t.toCharArray(g_missionTarget, sizeof(g_missionTarget));
+  if (s.length()) s.toCharArray(g_missionState, sizeof(g_missionState));
+}
+
 // SuperRot continuous-motion: A/V/P/S/K/H/U/C/?  (replies OK / ERR / telemetry).
 void parseSuperrot(String &line, Print &reply) {
   char k = line.charAt(0);
   if (k == 'C') { parseConfig(line); reply.print("OK\n"); return; }
+  if (k == 'M') { parseMission(line); reply.print("OK\n"); return; }
   if (k == 'H') { reply.print("OK\n"); homeAll(); return; }  // homing (blocks briefly)
   if (k == 'U') { unwindAz(); reply.print("OK\n"); return; }  // cable unwind
   if (line.startsWith("A2 ")) {
@@ -649,7 +700,7 @@ void handleSerial() {
         char k = line.charAt(0);
         bool easycomm = line.startsWith("AZ") || line.startsWith("EL") ||
                         line.startsWith("SA") || line.startsWith("SE");
-        bool superrot = !easycomm && strchr("AVPSKHUC?", k) != nullptr;
+        bool superrot = !easycomm && strchr("AVPSKHUC?M", k) != nullptr;
         if (superrot) {
           superrotSession = true;
           parseSuperrot(line, Serial);
@@ -725,6 +776,7 @@ void setup() {
   http.on("/api/status",  handleStatus);
   http.on("/api/goto",    handleGoto);
   http.on("/api/jog",     handleJog);
+  http.on("/api/trim",    handleTrim);
   http.on("/api/stop",    handleStop);
   http.on("/api/home",    handleHome);
   http.on("/api/park",    handlePark);

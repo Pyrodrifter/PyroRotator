@@ -84,6 +84,16 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .presets button{padding:10px 0;font-size:12px;color:var(--dim)}
 .act{display:grid;grid-template-columns:2fr 1fr 1fr;gap:8px}
 .btn-stop{background:#2a0d06;border-color:var(--org);color:var(--org);font-weight:700;letter-spacing:2px;padding:15px}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:0 0 12px;padding:4px;background:var(--panel);border:1px solid var(--line);border-radius:11px}
+.tabs button{padding:8px;border:0;background:transparent;color:var(--dim);font-size:11px;letter-spacing:1px}
+.tabs button.on{background:var(--panel2);color:var(--org);box-shadow:inset 0 0 0 1px var(--line)}
+.tabpane{display:none}.tabpane.on{display:block}
+.mission{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px 13px;background:linear-gradient(110deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:11px}
+.mission .orb{width:10px;height:10px;border-radius:50%;background:var(--org);box-shadow:0 0 12px var(--org)}
+.mission small{display:block;color:var(--dim);font-size:9px;letter-spacing:2px}.mission b{font-family:'Chakra Petch',sans-serif;font-size:16px}.mission em{margin-left:auto;color:var(--ok);font-style:normal;font-size:10px;letter-spacing:1px}
+.trimhero{padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:13px;margin-bottom:12px}.trimhero h2{margin:0 0 5px;font:700 18px 'Chakra Petch',sans-serif;color:var(--org)}.trimhero p{margin:0;color:var(--dim);font-size:11px;line-height:1.5}
+.trimgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.trimaxis{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}.trimaxis h3{margin:0 0 10px;color:var(--dim);font-size:10px;letter-spacing:2px}.trimval{font:700 32px 'Chakra Petch',sans-serif;margin-bottom:10px}.trimbuttons{display:grid;grid-template-columns:1fr 1fr;gap:6px}.trimbuttons button{padding:10px}.trimstep{display:flex;align-items:center;gap:8px;margin:12px 0}.trimstep label{color:var(--dim);font-size:11px}.trimstep select{margin-left:auto;padding:8px}.trimreset{width:100%;color:var(--org)}
+.diaggrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.diag{padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.diag small{display:block;color:var(--dim);font-size:9px;letter-spacing:1px;margin-bottom:5px}.diag b{font-size:12px}
 .foot{margin-top:16px;border-top:1px solid var(--line);padding-top:12px;
   display:flex;flex-wrap:wrap;gap:6px 16px;font-size:11px;color:var(--dim)}
 .led{display:inline-flex;align-items:center;gap:6px}
@@ -129,6 +139,15 @@ body.kiosk .go-row,body.kiosk .jog,body.kiosk .presets,body.kiosk .act{display:n
       <button class="topbtn" id="kiosk" title="Kiosk view">&#9974;</button>
     </div>
   </header>
+
+  <nav class="tabs">
+    <button class="on" data-tab="track">TRACK</button>
+    <button data-tab="trim">TRIM</button>
+    <button data-tab="system">SYSTEM</button>
+  </nav>
+  <div class="mission"><i class="orb"></i><div><small>SKYPHREAK MISSION</small><b id="missionTarget">No target</b></div><em id="missionState">STANDBY</em></div>
+
+  <section class="tabpane on" id="panel-track">
 
   <div class="tele">
     <div class="t"><div class="lbl">AZIMUTH</div>
@@ -192,6 +211,26 @@ body.kiosk .go-row,body.kiosk .jog,body.kiosk .presets,body.kiosk .act{display:n
     <button id="park">PARK</button>
   </div>
 
+  </section>
+
+  <section class="tabpane" id="panel-trim">
+    <div class="trimhero"><h2>Pointing trim</h2><p>Correct a small physical centering error without changing SkyPhreak's logical coordinates. Values persist on the controller.</p></div>
+    <div class="trimstep"><label>Adjustment step</label><select id="trimStep"><option value="0.05">0.05&deg;</option><option value="0.1" selected>0.10&deg;</option><option value="0.25">0.25&deg;</option><option value="0.5">0.50&deg;</option></select></div>
+    <div class="trimgrid">
+      <div class="trimaxis"><h3>AZIMUTH TRIM</h3><div class="trimval"><span id="trimAz">0.00</span>&deg;</div><div class="trimbuttons"><button data-trim="az" data-sign="-1">&minus;</button><button data-trim="az" data-sign="1">+</button></div></div>
+      <div class="trimaxis"><h3>ELEVATION TRIM</h3><div class="trimval"><span id="trimEl">0.00</span>&deg;</div><div class="trimbuttons"><button data-trim="el" data-sign="-1">&minus;</button><button data-trim="el" data-sign="1">+</button></div></div>
+    </div>
+    <button class="trimreset" id="trimReset">RESET BOTH TRIMS</button>
+  </section>
+
+  <section class="tabpane" id="panel-system">
+    <div class="diaggrid">
+      <div class="diag"><small>MOTION MODE</small><b id="diagMotion">--</b></div>
+      <div class="diag"><small>TRACK STATE</small><b id="diagTrack">--</b></div>
+      <div class="diag"><small>CONTROLLER FAULT</small><b id="diagFault">none</b></div>
+      <div class="diag"><small>CONTROL SOURCE</small><b id="diagControl">manual</b></div>
+    </div>
+
   <div class="foot">
     <span class="led" id="ledHome"><i></i>homed</span>
     <span class="led" id="ledMove"><i></i>slewing</span>
@@ -200,6 +239,7 @@ body.kiosk .go-row,body.kiosk .jog,body.kiosk .presets,body.kiosk .act{display:n
     <span class="kv" id="rssiKv" style="display:none"><span class="bars" id="bars"><i></i><i></i><i></i><i></i></span> <b id="rssi">--</b></span>
     <span class="kv" id="upKv" style="display:none">up <b id="uptime">--</b></span>
   </div>
+  </section>
 </div>
 
 <div class="overlay" id="ov">
@@ -222,6 +262,10 @@ body.kiosk .go-row,body.kiosk .jog,body.kiosk .presets,body.kiosk .act{display:n
 const $=s=>document.querySelector(s);
 (function(){const c=localStorage.getItem("accent");if(c){document.documentElement.style.setProperty("--org",c);document.getElementById("accentPick").value=c;}})();
 document.getElementById("accentPick").addEventListener("input",e=>{const c=e.target.value;document.documentElement.style.setProperty("--org",c);localStorage.setItem("accent",c);});
+document.querySelectorAll("[data-tab]").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll("[data-tab]").forEach(x=>x.classList.toggle("on",x===b));
+  document.querySelectorAll(".tabpane").forEach(x=>x.classList.toggle("on",x.id==="panel-"+b.dataset.tab));
+}));
 const R=140,CX=160,CY=160;let ELMAX=90;
 const EASE=matchMedia("(prefers-reduced-motion: reduce)").matches?1:0.18;
 const wrap=(d)=>((d+540)%360)-180;
@@ -242,6 +286,10 @@ const toast=m=>{const t=$("#toast");t.textContent=m;t.classList.add("show");
 const send=(u,m)=>fetch(u).then(()=>m&&toast(m)).catch(()=>toast("Link lost"));
 const stepv=()=>parseFloat($("#step").value);
 const goTo=(az,el)=>send(`/api/goto?az=${az}&el=${el}`,`Slewing to ${Math.round(az)}\u00B0 / ${Math.round(el)}\u00B0`);
+let trim={az:0,el:0};
+const setTrim=(az,el)=>fetch(`/api/trim?az=${az.toFixed(3)}&el=${el.toFixed(3)}`).then(r=>r.json()).then(v=>{trim={az:v.trimAz,el:v.trimEl};toast("Trim applied");}).catch(()=>toast("Trim failed"));
+document.querySelectorAll("[data-trim]").forEach(b=>b.addEventListener("click",()=>{const d=parseFloat($("#trimStep").value)*(+b.dataset.sign);setTrim(trim.az+(b.dataset.trim==="az"?d:0),trim.el+(b.dataset.trim==="el"?d:0));}));
+$("#trimReset").addEventListener("click",()=>setTrim(0,0));
 
 $("#go").addEventListener("click",()=>{const a=$("#iaz").value,e=$("#iel").value;
   if(a!==""&&e!=="")goTo(parseFloat(a),parseFloat(e));});
@@ -331,6 +379,10 @@ async function poll(){
       const lv=s.rssi>-55?4:s.rssi>-65?3:s.rssi>-72?2:s.rssi>-80?1:0;
       document.querySelectorAll("#bars i").forEach((b,i)=>b.classList.toggle("on",i<lv));}
     if(s.uptime!==undefined){$("#upKv").style.display="";$("#uptime").textContent=s.uptime;}
+    trim={az:s.trimAz||0,el:s.trimEl||0};$("#trimAz").textContent=trim.az.toFixed(2);$("#trimEl").textContent=trim.el.toFixed(2);
+    $("#missionTarget").textContent=s.missionTarget||"No target";$("#missionState").textContent=(s.missionState||"standby").toUpperCase();
+    $("#diagMotion").textContent=(s.motion||"idle").toUpperCase();$("#diagTrack").textContent=(s.trackState||"idle").toUpperCase();
+    $("#diagFault").textContent=s.fault||"none";$("#diagControl").textContent=s.control||"manual";
   }catch(e){
     const lk=$("#link");lk.classList.add("lost");lk.querySelector("b").innerHTML="&#9675; LINK LOST";
     $(".wrap").classList.add("stale");

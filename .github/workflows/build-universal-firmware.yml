@@ -5,11 +5,15 @@ on:
     branches: [main, "codex/**"]
     tags: ["v*"]
     paths:
+      - "PyroRotator.ino"
+      - "index_html.h"
       - "PyroRotatorUniversal/**"
       - "scripts/package_firmware.py"
       - ".github/workflows/build-universal-firmware.yml"
   pull_request:
     paths:
+      - "PyroRotator.ino"
+      - "index_html.h"
       - "PyroRotatorUniversal/**"
       - "scripts/package_firmware.py"
       - ".github/workflows/build-universal-firmware.yml"
@@ -58,6 +62,15 @@ jobs:
             --build-path "$PWD/build" \
             --warnings all \
             PyroRotatorUniversal
+
+      - name: Compile working PyroRotator fallback
+        run: |
+          mkdir -p build-working
+          arduino-cli compile \
+            --fqbn "${FQBN}" \
+            --build-path "$PWD/build-working" \
+            --warnings all \
+            .
 
       - name: Package flash images and checksummed manifest
         env:
