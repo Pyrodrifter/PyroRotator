@@ -215,6 +215,17 @@ void handleJson(const String &line, Print &out) {
     return;
   }
   if (cmd == "validate") { String why; if (!validateConfig(why)) jsonError(out,"invalid_config",why); else out.println("{\"ok\":true,\"valid\":true}"); return; }
+  if (cmd == "diagnose") {
+    if (!setupMode) { jsonError(out,"enter_setup_required"); return; }
+    String why; if (!validateConfig(why)) { jsonError(out,"invalid_config",why); return; }
+    driveEnableInactive(cfg.enablePin, cfg.enableActiveLow);
+    if (cfg.azLimitPin >= 0) pinMode(cfg.azLimitPin, cfg.azLimitActiveLow ? INPUT_PULLUP : INPUT);
+    if (cfg.elLimitPin >= 0) pinMode(cfg.elLimitPin, cfg.elLimitActiveLow ? INPUT_PULLUP : INPUT);
+    out.printf("{\"ok\":true,\"diagnostics\":true,\"driversDisabled\":true,\"stepPulses\":0,\"azLimit\":%s,\"elLimit\":%s}\n",
+      limitActive(cfg.azLimitPin,cfg.azLimitActiveLow)?"true":"false",
+      limitActive(cfg.elLimitPin,cfg.elLimitActiveLow)?"true":"false");
+    return;
+  }
   if (cmd == "save") {
     if (!setupMode) { jsonError(out,"enter_setup_required"); return; }
     String why; if (!validateConfig(why)) { jsonError(out,"invalid_config",why); return; }
