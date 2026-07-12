@@ -673,7 +673,12 @@ void handleTcp() {
     static uint32_t lastT = 0;
     if (millis() - lastT >= 100) {
       lastT = millis();
-      rotClient.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+      if (g_trackStreamActive) {
+        // AccelStepper emits pulses from loop(). Keep active telemetry below the
+        // transport buffer size so printf cannot pause the step train each 100 ms.
+        rotClient.printf("T %.4f %.4f %.4f %.4f\n",
+          currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL);
+      } else rotClient.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
         currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
         az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
         g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
@@ -729,7 +734,10 @@ void handleSerial() {
   }
   if (superrotSession && millis() - lastT >= 100) {
     lastT = millis();
-    Serial.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+    if (g_trackStreamActive) {
+      Serial.printf("T %.4f %.4f %.4f %.4f\n",
+        currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL);
+    } else Serial.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d capAz=%.1f capEl=%.1f ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
       currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
       az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
       g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
