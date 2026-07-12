@@ -18,7 +18,7 @@
    Control surfaces (NO GRBL):
      1) Web app          ->  http://rotator.local/      (port 80, manual control)
      2) rotctld / SuperRot TCP -> <esp-ip>:4533         (toggle in web app)
-     3) EasyComm II        ->  USB serial @ 9600         (SkyRoof via rotctld -m 202)
+   3) SuperRot / EasyComm II -> USB serial @ 115200
 
    Libraries: AccelStepper (Library Manager).  Everything else is ESP32 core.
    Board    : "ESP32 Dev Module".
@@ -29,14 +29,20 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>   // over-the-air firmware update (Arduino IDE / espota over WiFi)
 #include <AccelStepper.h>
+#include <Preferences.h>
 #include "index_html.h"   // web page lives here (keeps the raw-string HTML out
                           // of the .ino, which breaks Arduino's preprocessor)
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
+#endif
 
 // ----------------------------- CONFIG --------------------------------------
 // --- WiFi ---
-const char* WIFI_SSID = "Pyrolabs";        // TODO
-const char* WIFI_PASS = "67306730";    // TODO
 const char* HOSTNAME  = "rotator";          // -> http://rotator.local/
 
 // --- Mechanics (set these to YOUR build) ---
@@ -58,9 +64,38 @@ float g_elMax = 90.0;
 // --- Speeds (steps/sec) ---
 const float MAX_SPEED = 800.0;
 const float ACCEL     = 400.0;
+float g_trackKp = 1.6;
+float g_captureErr = 0.50;
+float g_trackErr = 0.08;
+float g_stateHyst = 0.04;
+float g_reverseHyst = 0.06;
+uint8_t g_settleSamples = 5;
+uint32_t g_commandTimeoutMs = 750;
 const float HOME_SPEED      = 300.0;    // fast seek to find the switch
 const float HOME_SPEED_SLOW = 80.0;     // slow final approach -> soft, repeatable contact
 const float HOME_ACCEL      = 1200.0;   // brisk decel while homing -> tiny overshoot into the switch
+
+// --- Runtime config (set live over SuperRot via `C key=value ...`, e.g. from the
+//     SkyPhreak "Push settings to rotator" button). Defaults keep stock behaviour. ---
+float g_maxSpeedAz = MAX_SPEED;   // per-axis speed cap (steps/s), from host maxVel °/s
+float g_maxSpeedEl = MAX_SPEED;
+float g_azOffset = 0, g_elOffset = 0;      // mount-alignment offset (deg) — stored for
+                                           // standalone use; host applies its own offset,
+                                           // so SuperRot 'A' tracking does NOT re-apply it
+float g_backlashAz = 0, g_backlashEl = 0;  // gear backlash (deg) — taken up on gotos
+int   g_lastDirAz = 0, g_lastDirEl = 0;    // last commanded travel direction per axis
+enum TrackState : uint8_t { TS_SLEW, TS_CAPTURE, TS_TRACK };
+TrackState g_trackAz = TS_SLEW, g_trackEl = TS_SLEW;
+uint8_t g_settleAz = 0, g_settleEl = 0;
+uint32_t g_lastTrackMs = 0;
+uint32_t g_lastTrackSeq = 0;
+bool g_trackStreamActive = false;
+
+enum MotionMode : uint8_t { MM_IDLE, MM_GOTO, MM_SLEW, MM_CAPTURE, MM_TRACK, MM_HOMING, MM_PARK, MM_FAULT };
+enum FaultCode : uint8_t { FAULT_NONE, FAULT_COMMAND_TIMEOUT, FAULT_HOME };
+MotionMode g_motionMode = MM_IDLE;
+FaultCode g_fault = FAULT_NONE;
+Preferences prefs;
 
 // --- Homing ---
 // Az has NO limit switch — zero is set by hand with a compass before power-up.
@@ -82,8 +117,9 @@ const float PARK_EL = 0.0;
 #define AZ_LIM  32          // reserved — az zero set by compass, not a switch
 #define EL_LIM  33          // INPUT_PULLUP, switch to GND (active LOW)
 
-// --- Serial (EasyComm) ---  match rotctld -s in SkyRoof
-const uint32_t SERIAL_BAUD = 9600;
+// --- Serial --- SuperRot uses 115200 8N1. EasyComm remains accepted on the same
+// port for legacy clients, which must also be configured for 115200 baud.
+const uint32_t SERIAL_BAUD = 115200;
 #define DEBUG 0             // 1 = boot/debug prints. Keep 0 when using EasyComm.
 // ---------------------------------------------------------------------------
 
@@ -131,6 +167,25 @@ String controlStr() {
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+const char* motionModeName() {
+  switch (g_motionMode) {
+    case MM_GOTO: return "goto"; case MM_SLEW: return "slew";
+    case MM_CAPTURE: return "capture"; case MM_TRACK: return "track";
+    case MM_HOMING: return "homing"; case MM_PARK: return "park";
+    case MM_FAULT: return "fault"; default: return "idle";
+  }
+}
+
+const char* faultName() {
+  switch (g_fault) {
+    case FAULT_COMMAND_TIMEOUT: return "command_timeout";
+    case FAULT_HOME: return "home_failed";
+    default: return "none";
+  }
+}
+
+void clearFault() { g_fault = FAULT_NONE; if (g_motionMode == MM_FAULT) g_motionMode = MM_IDLE; }
+
 // Nearest equivalent of a target heading to the current azimuth — the shortest-path
 // move (never more than 180°). Used by one-shot gotos (web/rotctld/park/jog) so e.g.
 // 0°→330° goes −30°, not +330°. (Streamed SuperRot 'A' setpoints stay absolute; the
@@ -141,6 +196,17 @@ float shortestAz(float target, float cur) {
   return cur + d;
 }
 
+// If a move reverses travel direction, bias the target by the backlash slack (in the
+// new direction) so the gear train takes up before the antenna actually moves. With
+// backlash 0 this is a no-op, so stock behaviour is unchanged.
+long backlashBias(AccelStepper &s, long target, float slackSteps, int &lastDir) {
+  long cur = s.currentPosition();
+  int dir = (target > cur) ? 1 : (target < cur ? -1 : lastDir);
+  if (dir && lastDir && dir != lastDir && slackSteps > 0) target += dir * lround(slackSteps);
+  lastDir = dir;
+  return target;
+}
+
 void gotoAzEl(float a, float e) {
   // Azimuth is FREE (no clamp) and takes the SHORTEST PATH from where it is — so a
   // one-shot goto to any heading turns the short way (may go negative). Only elevation
@@ -148,30 +214,55 @@ void gotoAzEl(float a, float e) {
   a = shortestAz(a, currentAz());
   e = clampf(e, EL_MIN, g_elMax);
   g_targetAz = a; g_targetEl = e;
+  g_trackStreamActive = false;
+  clearFault();
+  g_motionMode = MM_GOTO;
   motorsEnable();
-  // restore full speed in case SuperRot velocity-capped it on a previous move
-  az.setMaxSpeed(MAX_SPEED);
-  el.setMaxSpeed(MAX_SPEED);
-  az.moveTo(lround(a * SPD_AZ));
-  el.moveTo(lround(e * SPD_EL));
+  // restore full (configured) speed in case SuperRot velocity-capped it on a previous move
+  az.setMaxSpeed(g_maxSpeedAz);
+  el.setMaxSpeed(g_maxSpeedEl);
+  az.moveTo(backlashBias(az, lround(a * SPD_AZ), g_backlashAz * SPD_AZ, g_lastDirAz));
+  el.moveTo(backlashBias(el, lround(e * SPD_EL), g_backlashEl * SPD_EL, g_lastDirEl));
 }
 
 // --- SuperRot continuous motion (AccelStepper adaptation) ------------------
 // Track: drive toward a position at a velocity-derived speed cap. Because the
 // host streams setpoints continuously, the axis keeps moving instead of
 // decelerating to a halt on each command -> smooth tracking.
-void srAxisTrack(AccelStepper &s, float deg, float rate, float spd) {
-  float hz = fabs(rate) * spd;                 // requested speed in steps/s
+void srAxisTrack(AccelStepper &s, float deg, float rate, float spd, float maxHz,
+                 TrackState &state, uint8_t &settle, int &lastDir, float backlashDeg) {
+  float err = deg - s.currentPosition() / spd;
+  float ae = fabs(err);
+  if (state == TS_SLEW) {
+    if (ae < g_captureErr) state = TS_CAPTURE;
+  } else if (state == TS_CAPTURE) {
+    if (ae > g_captureErr + g_stateHyst) { state = TS_SLEW; settle = 0; }
+    else if (ae < g_trackErr) { if (++settle >= g_settleSamples) state = TS_TRACK; }
+    else settle = 0;
+  } else if (ae > g_trackErr + g_stateHyst) {
+    state = TS_CAPTURE; settle = 0;
+  }
+
+  float commandedRate = rate + g_trackKp * err;
+  int dir = commandedRate > 0 ? 1 : (commandedRate < 0 ? -1 : 0);
+  float noReverse = fmaxf(g_reverseHyst, backlashDeg);
+  if (state == TS_TRACK && dir && lastDir && dir != lastDir && ae < noReverse) {
+    commandedRate = 0;
+    dir = lastDir;
+  }
+  if (dir && fabs(commandedRate) > 0.01f) lastDir = dir;
+
+  float hz = fabs(commandedRate) * spd;
   float floorHz = 0.5f * spd / 60.0f;          // tiny floor so position still trims
   if (hz < floorHz) hz = floorHz;
-  if (hz > MAX_SPEED) hz = MAX_SPEED;
+  if (hz > maxHz) hz = maxHz;
   s.setMaxSpeed(hz);
   s.moveTo(lround(deg * spd));
 }
 
 // Pure velocity: drive toward the soft limit in the rate's direction at |rate|.
-void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi) {
-  float maxd = MAX_SPEED / spd;
+void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi, float maxHz) {
+  float maxd = maxHz / spd;
   rate = clampf(rate, -maxd, maxd);
   if (fabs(rate) < 1e-4) { s.moveTo(s.currentPosition()); return; }
   s.setMaxSpeed(fabs(rate) * spd);
@@ -181,23 +272,56 @@ void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi) {
 void srTrack(float a, float e, float aRate, float eRate) {
   e = clampf(e, EL_MIN, g_elMax);  // az free (shortest-path); el bounded
   g_targetAz = a; g_targetEl = e;
+  g_lastTrackMs = millis();
+  g_trackStreamActive = true;
+  clearFault();
   motorsEnable();
-  srAxisTrack(az, a, aRate, SPD_AZ);
-  srAxisTrack(el, e, eRate, SPD_EL);
+  srAxisTrack(az, a, aRate, SPD_AZ, g_maxSpeedAz, g_trackAz, g_settleAz, g_lastDirAz, g_backlashAz);
+  srAxisTrack(el, e, eRate, SPD_EL, g_maxSpeedEl, g_trackEl, g_settleEl, g_lastDirEl, g_backlashEl);
+  g_motionMode = (g_trackAz == TS_SLEW || g_trackEl == TS_SLEW) ? MM_SLEW
+    : (g_trackAz == TS_CAPTURE || g_trackEl == TS_CAPTURE) ? MM_CAPTURE : MM_TRACK;
+}
+
+const char* trackStateName() {
+  if (g_trackAz == TS_SLEW || g_trackEl == TS_SLEW) return "slew";
+  if (g_trackAz == TS_CAPTURE || g_trackEl == TS_CAPTURE) return "capture";
+  return "track";
 }
 
 void srVel(float aRate, float eRate) {
+  g_trackStreamActive = false;
+  clearFault();
+  g_motionMode = MM_SLEW;
   motorsEnable();
-  srAxisVel(az, aRate, SPD_AZ, AZ_MIN, AZ_MAX);
-  srAxisVel(el, eRate, SPD_EL, EL_MIN, g_elMax);
+  srAxisVel(az, aRate, SPD_AZ, AZ_MIN, AZ_MAX, g_maxSpeedAz);
+  srAxisVel(el, eRate, SPD_EL, EL_MIN, g_elMax, g_maxSpeedEl);
   g_targetAz = currentAz(); g_targetEl = currentEl();
 }
 
 void stopAll() {
+  g_trackStreamActive = false;
   az.stop();          // decelerate to a stop
   el.stop();
   g_targetAz = currentAz();
   g_targetEl = currentEl();
+  if (g_fault == FAULT_NONE) g_motionMode = MM_IDLE;
+}
+
+// Unwind the azimuth cable: drive to the 0-turn equivalent of the current heading —
+// same compass direction, but with accumulated turns removed. This is an ABSOLUTE move
+// and deliberately does NOT shortest-path, so it can turn a full revolution to take the
+// cable back to a neutral wrap. Only meaningful with the free/continuous azimuth model.
+void unwindAz() {
+  g_trackStreamActive = false;
+  clearFault();
+  g_motionMode = MM_GOTO;
+  float cur = currentAz();
+  float u = fmodf(cur, 360.0f);
+  if (u < 0) u += 360.0f;
+  g_targetAz = u;
+  motorsEnable();
+  az.setMaxSpeed(g_maxSpeedAz);
+  az.moveTo(lround(u * SPD_AZ));
 }
 
 // Drive one axis until its limit switch (active LOW) reads LOW; stop on first
@@ -261,6 +385,8 @@ bool homeAxis(AccelStepper &s, int limitPin, int dir, float spd) {
 }
 
 void homeAll() {
+  g_trackStreamActive = false;
+  g_motionMode = MM_HOMING;
   motorsEnable();
   // Az: no limit switch — physical 0° set by compass before power-up.
   az.setCurrentPosition(0);
@@ -268,6 +394,8 @@ void homeAll() {
   // El: drive to lower end stop, back off, zero. Flag if the switch was never seen.
   g_homeErr = !homeAxis(el, EL_LIM, HOME_DIR_EL, SPD_EL);
   g_homed   = !g_homeErr;
+  g_fault = g_homeErr ? FAULT_HOME : FAULT_NONE;
+  g_motionMode = g_homeErr ? MM_FAULT : MM_IDLE;
 
   g_targetAz = currentAz();
   g_targetEl = currentEl();
@@ -317,6 +445,7 @@ void handleElMode() {
   g_elMax = (g_elMax < 120.0f) ? 180.0f : 90.0f;
   // clamp el if we just dropped back to 90 and antenna is above it
   if (g_targetEl > g_elMax) gotoAzEl(g_targetAz, g_elMax);
+  prefs.putFloat("elMax", g_elMax);
   char b[32]; snprintf(b, sizeof(b), "{\"elMax\":%.0f}", g_elMax);
   http.send(200, "application/json", b);
 }
@@ -352,19 +481,85 @@ void parseRotctld(String &line) {
   }
 }
 
-// SuperRot continuous-motion: A/V/P/S/K/?  (replies OK / ERR / telemetry).
-void parseSuperrot(String &line) {
+// Apply one config key=value pair pushed by the host ("Push settings to rotator").
+// Unknown keys are ignored. Speeds arrive as °/s and are converted to steps/s, capped
+// by the hardware MAX_SPEED. Offsets are stored (host applies its own for SuperRot).
+void applyConfigKV(const char* key, float v) {
+  if      (!strcmp(key, "maxVelAz")) g_maxSpeedAz = fminf(v * SPD_AZ, MAX_SPEED);
+  else if (!strcmp(key, "maxVelEl")) g_maxSpeedEl = fminf(v * SPD_EL, MAX_SPEED);
+  else if (!strcmp(key, "elMax"))    g_elMax = clampf(v, 90.0f, 180.0f);
+  else if (!strcmp(key, "azOffset")) g_azOffset = v;
+  else if (!strcmp(key, "elOffset")) g_elOffset = v;
+  else if (!strcmp(key, "backlashAz")) g_backlashAz = fmaxf(0.0f, v);
+  else if (!strcmp(key, "backlashEl")) g_backlashEl = fmaxf(0.0f, v);
+  else if (!strcmp(key, "trackKp")) g_trackKp = clampf(v, 0.05f, 10.0f);
+  else if (!strcmp(key, "captureErr")) g_captureErr = clampf(v, 0.05f, 10.0f);
+  else if (!strcmp(key, "trackErr")) g_trackErr = clampf(v, 0.005f, g_captureErr);
+  else if (!strcmp(key, "stateHyst")) g_stateHyst = clampf(v, 0.0f, 2.0f);
+  else if (!strcmp(key, "reverseHyst")) g_reverseHyst = clampf(v, 0.0f, 2.0f);
+  else if (!strcmp(key, "settleSamples")) g_settleSamples = (uint8_t)clampf(v, 1, 50);
+  else if (!strcmp(key, "commandTimeoutMs")) g_commandTimeoutMs = (uint32_t)clampf(v, 250, 10000);
+}
+
+void saveRuntimeConfig() {
+  prefs.putFloat("maxAzHz", g_maxSpeedAz); prefs.putFloat("maxElHz", g_maxSpeedEl);
+  prefs.putFloat("elMax", g_elMax); prefs.putFloat("azOff", g_azOffset); prefs.putFloat("elOff", g_elOffset);
+  prefs.putFloat("backAz", g_backlashAz); prefs.putFloat("backEl", g_backlashEl);
+  prefs.putFloat("trkKp", g_trackKp); prefs.putFloat("capErr", g_captureErr); prefs.putFloat("trkErr", g_trackErr);
+  prefs.putFloat("stHyst", g_stateHyst); prefs.putFloat("revHyst", g_reverseHyst);
+  prefs.putUChar("settle", g_settleSamples); prefs.putUInt("timeout", g_commandTimeoutMs);
+}
+
+void loadRuntimeConfig() {
+  g_maxSpeedAz = prefs.getFloat("maxAzHz", MAX_SPEED); g_maxSpeedEl = prefs.getFloat("maxElHz", MAX_SPEED);
+  g_elMax = prefs.getFloat("elMax", 90); g_azOffset = prefs.getFloat("azOff", 0); g_elOffset = prefs.getFloat("elOff", 0);
+  g_backlashAz = prefs.getFloat("backAz", 0); g_backlashEl = prefs.getFloat("backEl", 0);
+  g_trackKp = prefs.getFloat("trkKp", 1.6); g_captureErr = prefs.getFloat("capErr", .5);
+  g_trackErr = prefs.getFloat("trkErr", .08); g_stateHyst = prefs.getFloat("stHyst", .04);
+  g_reverseHyst = prefs.getFloat("revHyst", .06); g_settleSamples = prefs.getUChar("settle", 5);
+  g_commandTimeoutMs = prefs.getUInt("timeout", 750);
+}
+
+// Parse a `C key=value key=value ...` config line.
+void parseConfig(String &line) {
+  char buf[120];
+  line.toCharArray(buf, sizeof(buf));
+  for (char* t = strtok(buf + 1, " "); t; t = strtok(NULL, " ")) {
+    char* eq = strchr(t, '=');
+    if (!eq) continue;
+    *eq = 0;
+    applyConfigKV(t, atof(eq + 1));
+  }
+  saveRuntimeConfig();
+}
+
+// SuperRot continuous-motion: A/V/P/S/K/H/U/C/?  (replies OK / ERR / telemetry).
+void parseSuperrot(String &line, Print &reply) {
   char k = line.charAt(0);
+  if (k == 'C') { parseConfig(line); reply.print("OK\n"); return; }
+  if (k == 'H') { reply.print("OK\n"); homeAll(); return; }  // homing (blocks briefly)
+  if (k == 'U') { unwindAz(); reply.print("OK\n"); return; }  // cable unwind
+  if (line.startsWith("A2 ")) {
+    unsigned long seq; float a, b, c, d;
+    if (sscanf(line.c_str() + 2, "%lu %f %f %f %f", &seq, &a, &b, &c, &d) != 5) {
+      reply.print("ERR bad_A2\n"); return;
+    }
+    if (g_lastTrackSeq && (int32_t)((uint32_t)seq - g_lastTrackSeq) <= 0) {
+      reply.print("ERR stale_seq\n"); return;
+    }
+    g_lastTrackSeq = (uint32_t)seq;
+    srTrack(a, b, c, d); reply.print("OK\n"); return;
+  }
   float a = 0, b = 0, c = 0, d = 0;
   sscanf(line.c_str() + 1, "%f %f %f %f", &a, &b, &c, &d);
   switch (k) {
-    case 'A': srTrack(a, b, c, d);          rotClient.print("OK\n"); break;
-    case 'V': srVel(a, b);                  rotClient.print("OK\n"); break;
-    case 'P': gotoAzEl(a, b);               rotClient.print("OK\n"); break;
-    case 'S': stopAll();                    rotClient.print("OK\n"); break;
-    case 'K': gotoAzEl(PARK_AZ, PARK_EL);   rotClient.print("OK\n"); break;
+    case 'A': srTrack(a, b, c, d);          reply.print("OK\n"); break;
+    case 'V': srVel(a, b);                  reply.print("OK\n"); break;
+    case 'P': gotoAzEl(a, b);               reply.print("OK\n"); break;
+    case 'S': stopAll();                    reply.print("OK\n"); break;
+    case 'K': gotoAzEl(PARK_AZ, PARK_EL);   reply.print("OK\n"); break;
     case '?': /* telemetry streamed in handleTcp */                  break;
-    default:  rotClient.print("ERR unknown\n");                      break;
+    default:  reply.print("ERR unknown\n");                          break;
   }
 }
 
@@ -372,6 +567,7 @@ void handleTcp() {
   if (!rotClient || !rotClient.connected()) {
     if (rotClient) rotClient.stop();   // free the old socket so a reconnect is accepted
     rotClient = rotctld.available();
+    if (rotClient) { g_lastTrackSeq = 0; g_trackStreamActive = false; }
     return;
   }
   static String line;
@@ -380,7 +576,7 @@ void handleTcp() {
     if (c == '\n' || c == '\r') {
       if (line.length()) {
         line.trim();
-        if (g_proto == PROTO_SUPERROT) parseSuperrot(line);
+        if (g_proto == PROTO_SUPERROT) parseSuperrot(line, rotClient);
         else                           parseRotctld(line);
       }
       line = "";
@@ -388,25 +584,46 @@ void handleTcp() {
       line += c;
     }
   }
-  // SuperRot streams telemetry ~10 Hz so the host can close its tracking loop.
+  // SuperRot streams telemetry ~10 Hz so the host can close its tracking loop. The
+  // trailing key=value fields are diagnostics the host shows when present (endstop
+  // states, homed flag, ESP32 core temperature) — older hosts ignore the extras.
   if (g_proto == PROTO_SUPERROT && rotClient.connected()) {
     static uint32_t lastT = 0;
     if (millis() - lastT >= 100) {
       lastT = millis();
-      rotClient.printf("T %.2f %.2f %.3f %.3f\n",
-        currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL);
+      rotClient.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+        currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
+        az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
+        g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
+        (unsigned long)(g_lastTrackMs ? millis() - g_lastTrackMs : 0),
+        digitalRead(AZ_LIM) == LOW ? 1 : 0, digitalRead(EL_LIM) == LOW ? 1 : 0,
+        g_homed ? 1 : 0, temperatureRead());
     }
   }
 }
 
-// ----------------------------- EasyComm II (serial) ------------------------
-// Tokens "AZ123.4" / "EL45.6" set target; bare "AZ EL" queries position.
-void handleEasycomm() {
+// ---------------------- USB serial (SuperRot / EasyComm) -------------------
+// SuperRot is auto-detected from its command letter. Legacy EasyComm tokens
+// "AZ123.4" / "EL45.6" remain accepted on the same 115200-baud connection.
+void handleSerial() {
   static String line;
+  static bool superrotSession = false;
+  static uint32_t lastT = 0;
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (line.length()) {
+        line.trim();
+        char k = line.charAt(0);
+        bool easycomm = line.startsWith("AZ") || line.startsWith("EL") ||
+                        line.startsWith("SA") || line.startsWith("SE");
+        bool superrot = !easycomm && strchr("AVPSKHUC?", k) != nullptr;
+        if (superrot) {
+          superrotSession = true;
+          parseSuperrot(line, Serial);
+          line = "";
+          continue;
+        }
         float a = currentAz(), e = currentEl();
         bool setA = false, setE = false, query = false;
         char buf[80]; line.toCharArray(buf, sizeof(buf));
@@ -423,9 +640,19 @@ void handleEasycomm() {
         if (query) Serial.printf("AZ%.1f EL%.1f\n", currentAz(), currentEl());
       }
       line = "";
-    } else if (line.length() < 70) {
+    } else if (line.length() < 119) {
       line += c;
     }
+  }
+  if (superrotSession && millis() - lastT >= 100) {
+    lastT = millis();
+    Serial.printf("T %.6f %.6f %.6f %.6f azSteps=%ld elSteps=%ld state=%s mode=%s fault=%s seq=%lu errAz=%.6f errEl=%.6f dirAz=%d dirEl=%d ageMs=%lu esAz=%d esEl=%d homed=%d tempC=%.1f\n",
+      currentAz(), currentEl(), az.speed() / SPD_AZ, el.speed() / SPD_EL,
+      az.currentPosition(), el.currentPosition(), trackStateName(), motionModeName(), faultName(), (unsigned long)g_lastTrackSeq,
+      g_targetAz - currentAz(), g_targetEl - currentEl(), g_lastDirAz, g_lastDirEl,
+      (unsigned long)(g_lastTrackMs ? millis() - g_lastTrackMs : 0),
+      digitalRead(AZ_LIM) == LOW ? 1 : 0, digitalRead(EL_LIM) == LOW ? 1 : 0,
+      g_homed ? 1 : 0, temperatureRead());
   }
 }
 
@@ -437,20 +664,29 @@ void setup() {
   pinMode(EL_LIM, INPUT_PULLUP);
 
   Serial.begin(SERIAL_BAUD);
+  prefs.begin("pyro-rot", false);
+  loadRuntimeConfig();
 
   az.setMaxSpeed(MAX_SPEED);  az.setAcceleration(ACCEL);
   el.setMaxSpeed(MAX_SPEED);  el.setAcceleration(ACCEL);
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (WIFI_SSID[0]) WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(200);
+  while (WIFI_SSID[0] && WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(200);
   if (WiFi.status() != WL_CONNECTED) {        // fallback: own AP
     WiFi.mode(WIFI_AP);
     WiFi.softAP("PyroRotator", "pyrolabs");
   }
   MDNS.begin(HOSTNAME);
+
+  // Over-the-air updates: flash new firmware from the Arduino IDE (network port) or
+  // espota.py without a USB cable. Motors are disabled before an update starts so the
+  // mount can't be left driving if the reboot interrupts a move.
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.onStart([]() { stopAll(); motorsDisable(); });
+  ArduinoOTA.begin();
 
   http.on("/",            handleRoot);
   http.on("/api/status",  handleStatus);
@@ -478,7 +714,17 @@ void setup() {
 void loop() {
   az.run();
   el.run();
+  ArduinoOTA.handle();
   http.handleClient();
   handleTcp();
-  handleEasycomm();
+  handleSerial();
+  if (g_trackStreamActive && millis() - g_lastTrackMs > g_commandTimeoutMs) {
+    az.stop(); el.stop();
+    g_trackStreamActive = false;
+    g_fault = FAULT_COMMAND_TIMEOUT;
+    g_motionMode = MM_FAULT;
+    g_targetAz = currentAz(); g_targetEl = currentEl();
+  } else if (!g_trackStreamActive && g_motionMode == MM_GOTO && !isMoving()) {
+    g_motionMode = MM_IDLE;
+  }
 }

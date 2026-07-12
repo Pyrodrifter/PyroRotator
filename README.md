@@ -54,6 +54,9 @@ Microstepping is set by the **MS1/MS2 jumpers** on the shield and must match
 - Flash, then browse to `http://rotator.local/`.
 
 ## Motion notes
+- **Hybrid homing**: point azimuth north manually, then send `H`. Firmware records
+  the current AZ attitude as 0 degrees while EL performs its two-stage limit-switch
+  seek, backoff, slow re-approach, and zeroing sequence.
 - **Azimuth travel 0–450°** (90° overlap past a full turn). The host streams
   **continuous (unwrapped)** azimuth and owns trajectory continuity; the firmware
   positions **absolutely** and does not wrap — so a pass can cross north without

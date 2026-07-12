@@ -8,3 +8,4 @@ build/
 *.elf
 *.hex
 *.log
+secrets.h
