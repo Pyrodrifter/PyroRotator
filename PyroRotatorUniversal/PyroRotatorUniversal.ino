@@ -280,7 +280,7 @@ void handleSuperrot(String line, Print &out) {
   if(line[0]=='{'){handleJson(line,out);return;}
   if(setupMode){jsonError(out,"setup_mode","save valid configuration and reboot");return;}
   unsigned long seq; float a,b,c,d;
-  if(line.startsWith("A2 ")){if(sscanf(line.c_str()+2,"%lu %f %f %f %f",&seq,&a,&b,&c,&d)==5){if(lastSequence&&(int32_t)(seq-lastSequence)<=0){out.print("ERR stale_seq\n");return;}lastSequence=seq;trackPosition(a,b,c,d);out.print("OK\n");}else out.print("ERR bad_A2\n");return;}
+  if(line.startsWith("A2 ")){if(sscanf(line.c_str()+2,"%lu %f %f %f %f",&seq,&a,&b,&c,&d)==5){if(tracking&&lastSequence&&(int32_t)(seq-lastSequence)<=0){out.print("ERR stale_seq\n");return;}lastSequence=seq;trackPosition(a,b,c,d);out.print("OK\n");}else out.print("ERR bad_A2\n");return;}
   switch(line[0]){
     case 'A': if(sscanf(line.c_str()+1,"%f %f %f %f",&a,&b,&c,&d)==4){trackPosition(a,b,c,d);out.print("OK\n");}else out.print("ERR bad_A\n");break;
     case 'P': if(sscanf(line.c_str()+1,"%f %f",&a,&b)==2){gotoPosition(a,b);out.print("OK\n");}else out.print("ERR bad_P\n");break;

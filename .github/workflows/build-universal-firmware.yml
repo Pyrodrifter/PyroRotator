@@ -1,0 +1,92 @@
+name: Build universal firmware
+
+on:
+  push:
+    branches: [main, "codex/**"]
+    tags: ["v*"]
+    paths:
+      - "PyroRotatorUniversal/**"
+      - "scripts/package_firmware.py"
+      - ".github/workflows/build-universal-firmware.yml"
+  pull_request:
+    paths:
+      - "PyroRotatorUniversal/**"
+      - "scripts/package_firmware.py"
+      - ".github/workflows/build-universal-firmware.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FQBN: esp32:esp32:esp32
+      ESP32_CORE_VERSION: 3.3.0
+      ACCELSTEPPER_VERSION: 1.65
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deterministic motion tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.3.1
+
+      - name: Install pinned board core and library
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install "AccelStepper@${ACCELSTEPPER_VERSION}"
+
+      - name: Compile ESP32 Dev Module firmware
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn "${FQBN}" \
+            --build-path "$PWD/build" \
+            --warnings all \
+            PyroRotatorUniversal
+
+      - name: Package flash images and checksummed manifest
+        env:
+          FIRMWARE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: |
+          BOOT_APP=$(find "$HOME/.arduino15/packages/esp32" -type f -name boot_app0.bin -print -quit)
+          test -n "$BOOT_APP"
+          cp "$BOOT_APP" build/boot_app0.bin
+
+          ESPTOOL=$(find "$HOME/.arduino15/packages/esp32/tools" -type f \( -name esptool -o -name esptool.py \) -print -quit)
+          if [ -n "$ESPTOOL" ]; then
+            chmod +x "$ESPTOOL"
+            export PATH="$(dirname "$ESPTOOL"):$PATH"
+          fi
+
+          python3 scripts/package_firmware.py \
+            --build-dir build \
+            --output-dir release \
+            --version "${FIRMWARE_VERSION}"
+
+      - name: Upload flashable firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: superrot-universal-esp32-${{ github.run_number }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged universal firmware
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          zip -9 ../superrot-universal-esp32.zip *
+          cd ..
+          gh release create "${GITHUB_REF_NAME}" superrot-universal-esp32.zip \
+            --title "SuperRot Universal ${GITHUB_REF_NAME}" --generate-notes

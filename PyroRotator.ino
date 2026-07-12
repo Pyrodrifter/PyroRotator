@@ -575,7 +575,7 @@ void parseSuperrot(String &line, Print &reply) {
     if (sscanf(line.c_str() + 2, "%lu %f %f %f %f", &seq, &a, &b, &c, &d) != 5) {
       reply.print("ERR bad_A2\n"); return;
     }
-    if (g_lastTrackSeq && (int32_t)((uint32_t)seq - g_lastTrackSeq) <= 0) {
+    if (g_trackStreamActive && g_lastTrackSeq && (int32_t)((uint32_t)seq - g_lastTrackSeq) <= 0) {
       reply.print("ERR stale_seq\n"); return;
     }
     g_lastTrackSeq = (uint32_t)seq;
