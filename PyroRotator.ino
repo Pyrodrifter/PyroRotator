@@ -35,22 +35,26 @@
 
 // ----------------------------- CONFIG --------------------------------------
 // --- WiFi ---
-const char* WIFI_SSID = "Pyrolabs";        // TODO
-const char* WIFI_PASS = "67306730";    // TODO
+const char* WIFI_SSID = "YOUR_SSID";        // TODO
+const char* WIFI_PASS = "YOUR_PASSWD";    // TODO
 const char* HOSTNAME  = "rotator";          // -> http://rotator.local/
 
 // --- Mechanics (set these to YOUR build) ---
 const float MOTOR_STEPS = 200.0;   // 1.8deg NEMA 17 = 200 full steps/rev
-const float MICROSTEP   = 8.0;     // MUST match the CNC shield MS jumpers (see header table)
-const float GEAR_AZ     = 7.5;     // 20t -> 150t
-const float GEAR_EL     = 4.0;     // 20t -> 80t
+const float MICROSTEP   = 32.0;     // MUST match the CNC shield MS jumpers (see header table)
+const float GEAR_AZ     = 1.0; //7.5;     // 20t -> 150t - using 1 for testing until a gearbox or belt drive system are added.
+const float GEAR_EL     = 1.0; //4.0;     // 20t -> 80t
 
 // steps the motor takes per 1 degree of ANTENNA movement
 const float SPD_AZ = (MOTOR_STEPS * MICROSTEP * GEAR_AZ) / 360.0;
 const float SPD_EL = (MOTOR_STEPS * MICROSTEP * GEAR_EL) / 360.0;
 
 // --- Travel / soft limits (degrees) ---
-const float AZ_MIN = -3600.0, AZ_MAX = 3600.0; // az is free (shortest-path); wide bound for velocity-jog only
+// Az travel is HARD-LIMITED so the cable can never wind up. Range is [AZ_MIN, AZ_MAX];
+// AZ_OVERLAP_DEG is the travel allowed past a full turn (90 = 0..450°, 0 = strictly 0..360°).
+// Zero is set by hand with a compass before power-up.
+const float AZ_OVERLAP_DEG = 90.0;
+const float AZ_MIN = 0.0, AZ_MAX = 360.0 + AZ_OVERLAP_DEG;
 const float EL_MIN = 0.0;
 // EL_MAX is runtime-togglable via /api/elmode (90 = normal, 180 = flip-over passes)
 float g_elMax = 90.0;
@@ -67,6 +71,7 @@ const float HOME_ACCEL      = 1200.0;   // brisk decel while homing -> tiny over
 // El has end stops and homes to its lower limit switch.
 const int   HOME_DIR_EL = -1;         // direction to drive toward the EL lower end stop
 const float HOME_BACKOFF_DEG = 5.0;   // back off this far after the switch trips
+const float EL_SEEK_MAX_DEG  = 200.0; // max blind travel while seeking the EL switch (> full el range)
 const bool  AUTO_HOME_ON_BOOT = false; // true = home el automatically at power-up
 
 // --- Park position ---
@@ -84,7 +89,7 @@ const float PARK_EL = 0.0;
 
 // --- Serial (EasyComm) ---  match rotctld -s in SkyRoof
 const uint32_t SERIAL_BAUD = 9600;
-#define DEBUG 0             // 1 = boot/debug prints. Keep 0 when using EasyComm.
+#define DEBUG 1             // 1 = boot/debug prints. Keep 0 when using EasyComm.
 // ---------------------------------------------------------------------------
 
 AccelStepper az(AccelStepper::DRIVER, AZ_STEP, AZ_DIR);
@@ -131,21 +136,27 @@ String controlStr() {
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// Nearest equivalent of a target heading to the current azimuth — the shortest-path
-// move (never more than 180°). Used by one-shot gotos (web/rotctld/park/jog) so e.g.
-// 0°→330° goes −30°, not +330°. (Streamed SuperRot 'A' setpoints stay absolute; the
-// host already resolves their continuity.)
+// Equivalent of a target heading (target + k*360) that lies inside [AZ_MIN, AZ_MAX],
+// choosing the one closest to the current azimuth. Never leaves the travel range, so
+// e.g. at 270° a goto of 7° turns back through south (-263°) rather than winding past
+// 360°. With overlap > 0 the shorter path past 360° is used only when it fits.
 float shortestAz(float target, float cur) {
-  float d = target - cur;
-  d -= 360.0f * roundf(d / 360.0f);
-  return cur + d;
+  float t = fmodf(target, 360.0f);
+  if (t < 0) t += 360.0f;
+  float best = clampf(t, AZ_MIN, AZ_MAX);
+  float bestD = 1e9f;
+  bool found = false;
+  for (float c = t; c <= AZ_MAX + 0.001f; c += 360.0f) {
+    if (c < AZ_MIN - 0.001f) continue;
+    float d = fabsf(c - cur);
+    if (!found || d < bestD) { best = c; bestD = d; found = true; }
+  }
+  return best;
 }
 
-void gotoAzEl(float a, float e) {
-  // Azimuth is FREE (no clamp) and takes the SHORTEST PATH from where it is — so a
-  // one-shot goto to any heading turns the short way (may go negative). Only elevation
-  // is bounded (0..elMax, elMax up to 180 for flip).
-  a = shortestAz(a, currentAz());
+// Move to an absolute, already-bounded position (az clamped to travel, el to its range).
+void gotoAzElAbs(float a, float e) {
+  a = clampf(a, AZ_MIN, AZ_MAX);
   e = clampf(e, EL_MIN, g_elMax);
   g_targetAz = a; g_targetEl = e;
   motorsEnable();
@@ -154,6 +165,11 @@ void gotoAzEl(float a, float e) {
   el.setMaxSpeed(MAX_SPEED);
   az.moveTo(lround(a * SPD_AZ));
   el.moveTo(lround(e * SPD_EL));
+}
+
+// Treat `a` as a compass heading: wrap into the travel range, nearest path.
+void gotoAzEl(float a, float e) {
+  gotoAzElAbs(shortestAz(a, currentAz()), e);
 }
 
 // --- SuperRot continuous motion (AccelStepper adaptation) ------------------
@@ -179,7 +195,8 @@ void srAxisVel(AccelStepper &s, float rate, float spd, float lo, float hi) {
 }
 
 void srTrack(float a, float e, float aRate, float eRate) {
-  e = clampf(e, EL_MIN, g_elMax);  // az free (shortest-path); el bounded
+  e = clampf(e, EL_MIN, g_elMax);
+  a = clampf(a, AZ_MIN, AZ_MAX);   // streamed setpoints must never exceed az travel
   g_targetAz = a; g_targetEl = e;
   motorsEnable();
   srAxisTrack(az, a, aRate, SPD_AZ);
@@ -206,7 +223,7 @@ void stopAll() {
 // grind into the hard stop). Brisk HOME_ACCEL keeps the decel-into-switch tiny.
 static bool seekSwitch(AccelStepper &s, int limitPin, int dir, float spd, bool slow) {
   s.setMaxSpeed(slow ? HOME_SPEED_SLOW : HOME_SPEED);
-  s.move(dir * lround(spd * (slow ? (HOME_BACKOFF_DEG * 4 + 10) : 400.0)));
+  s.move(dir * lround(spd * (slow ? (HOME_BACKOFF_DEG * 4 + 10) : EL_SEEK_MAX_DEG)));
   bool found = false;
   while (s.distanceToGo() != 0) {
     s.run();
@@ -268,6 +285,10 @@ void homeAll() {
   // El: drive to lower end stop, back off, zero. Flag if the switch was never seen.
   g_homeErr = !homeAxis(el, EL_LIM, HOME_DIR_EL, SPD_EL);
   g_homed   = !g_homeErr;
+  // A failed seek leaves the step counter at the blind-travel end (e.g. -371°), which
+  // would make later moves drive hundreds of degrees. The seek runs toward the lower
+  // end stop, so treat where it ended as 0 — but g_homeErr stays set to flag it.
+  if (g_homeErr) el.setCurrentPosition(0);
 
   g_targetAz = currentAz();
   g_targetEl = currentEl();
@@ -305,8 +326,8 @@ void handleGoto() {
 void handleJog() {
   float d = http.arg("delta").toFloat();
   String ax = http.arg("axis");
-  if (ax == "az") gotoAzEl(g_targetAz + d, g_targetEl);
-  else            gotoAzEl(g_targetAz, g_targetEl + d);
+  if (ax == "az") gotoAzElAbs(g_targetAz + d, g_targetEl);
+  else            gotoAzElAbs(g_targetAz, g_targetEl + d);
   http.send(200, "text/plain", "OK");
 }
 
@@ -316,7 +337,7 @@ void handleHome()   { http.send(200, "text/plain", "homing"); homeAll(); }
 void handleElMode() {
   g_elMax = (g_elMax < 120.0f) ? 180.0f : 90.0f;
   // clamp el if we just dropped back to 90 and antenna is above it
-  if (g_targetEl > g_elMax) gotoAzEl(g_targetAz, g_elMax);
+  if (g_targetEl > g_elMax) gotoAzElAbs(g_targetAz, g_elMax);
   char b[32]; snprintf(b, sizeof(b), "{\"elMax\":%.0f}", g_elMax);
   http.send(200, "application/json", b);
 }

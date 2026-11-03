@@ -54,9 +54,13 @@ Microstepping is set by the **MS1/MS2 jumpers** on the shield and must match
 - Flash, then browse to `http://rotator.local/`.
 
 ## Motion notes
-- **Azimuth travel 0–450°** (90° overlap past a full turn). The host streams
+- **Azimuth travel 0–450°** (90° overlap past a full turn, `AZ_OVERLAP_DEG`). The
+  firmware **hard-limits** azimuth to this range: one-shot commands (rotctld `P`, web
+  goto/park, EasyComm) are wrapped to the equivalent heading inside the range nearest
+  the current position, and jog / streamed SuperRot setpoints are clamped to it, so the
+  cable can never wind past the limit. The host streams
   **continuous (unwrapped)** azimuth and owns trajectory continuity; the firmware
-  positions **absolutely** and does not wrap — so a pass can cross north without
+  positions **absolutely** — so a pass can cross north without
   unwinding. Unwind the cable manually (or via SkyPhreak's auto-unwind) when wound
   near the limit.
 - **Two-stage homing**: fast seek → back off → slow gentle re-approach, so contact is
